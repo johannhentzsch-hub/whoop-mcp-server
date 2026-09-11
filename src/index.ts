@@ -342,6 +342,12 @@ async function main(): Promise<void> {
 	} else {
 		const app = express();
 		app.use(express.json());
+		app.use((req: Request, res: Response, next) => {
+	res.on('finish', () => {
+		console.log(`${req.method} ${req.url} → ${res.statusCode} session=${req.headers['mcp-session-id'] ?? '-'} method=${req.body?.method ?? '-'}`);
+	});
+	next();
+});
 
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
@@ -375,28 +381,31 @@ async function main(): Promise<void> {
 				return;
 			}
 
-			if (req.method === 'POST') {
-				let transport: StreamableHTTPServerTransport;
+					if (req.method === 'POST') {
+			let transport: StreamableHTTPServerTransport;
+			const isInit = req.body?.method === 'initialize';
 
-				if (sessionId && transports.has(sessionId)) {
-					const session = transports.get(sessionId)!;
-					session.lastAccess = Date.now();
-					transport = session.transport;
-				} else {
-					transport = new StreamableHTTPServerTransport({
-						sessionIdGenerator: () => crypto.randomUUID(),
-						onsessioninitialized: newSessionId => {
-							transports.set(newSessionId, { transport, lastAccess: Date.now() });
-						},
-					});
-
-					const server = createMcpServer();
-					await server.connect(transport);
-				}
-
-				await transport.handleRequest(req, res, req.body);;
+			if (sessionId && transports.has(sessionId)) {
+				const session = transports.get(sessionId)!;
+				session.lastAccess = Date.now();
+				transport = session.transport;
+			} else if (!sessionId || isInit) {
+				transport = new StreamableHTTPServerTransport({
+					sessionIdGenerator: () => crypto.randomUUID(),
+					onsessioninitialized: newSessionId => {
+						transports.set(newSessionId, { transport, lastAccess: Date.now() });
+					},
+				});
+				const server = createMcpServer();
+				await server.connect(transport);
+			} else {
+				res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
 				return;
 			}
+
+			await transport.handleRequest(req, res, req.body);
+			return;
+		}
 
 			res.status(405).send('Method not allowed');
 		});
