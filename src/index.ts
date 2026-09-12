@@ -6,10 +6,19 @@ import express, { type Request, type Response } from 'express';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
+import { YazioService } from './yazio.js';
 
 interface ToolArguments {
 	days?: number;
 	full?: boolean;
+	date?: string;
+	query?: string;
+	product_id?: string;
+	daytime?: 'breakfast' | 'lunch' | 'dinner' | 'snack';
+	amount?: number;
+	serving?: string;
+	serving_quantity?: number;
+	entry_id?: string;
 }
 
 const config = {
@@ -35,6 +44,7 @@ if (existingTokens) {
 }
 
 const sync = new WhoopSync(client, db);
+const yazio = YazioService.fromEnv();
 
 const SESSION_TTL_MS = 30 * 60 * 1000;
 const transports = new Map<string, { transport: StreamableHTTPServerTransport; lastAccess: number }>();
@@ -146,6 +156,74 @@ function createMcpServer(): Server {
 				description: 'Get the Whoop authorization URL to connect your account.',
 				inputSchema: { type: 'object', properties: {}, required: [] },
 			},
+			...(yazio ? [
+				{
+					name: 'get_nutrition',
+					description: 'Yazio: Ernährung eines Tages – Kalorien und Makros vs. Ziele, Mahlzeiten, Wasser, Schritte und alle Einträge. Ohne date = heute.',
+					inputSchema: {
+						type: 'object',
+						properties: { date: { type: 'string', description: 'Datum YYYY-MM-DD (optional, Standard heute)' } },
+						required: [],
+					},
+				},
+				{
+					name: 'get_nutrition_trends',
+					description: 'Yazio: Tagesbilanzen (kcal, Protein, KH, Fett, Wasser, Schritte) über mehrere Tage plus Durchschnitt und Zielerreichung.',
+					inputSchema: {
+						type: 'object',
+						properties: { days: { type: 'number', description: 'Anzahl Tage (Standard 14, max 30)' } },
+						required: [],
+					},
+				},
+				{
+					name: 'search_food',
+					description: 'Yazio: Lebensmittel in der Yazio-Datenbank suchen. Liefert product_id, Portionen und Nährwerte zum anschließenden Loggen.',
+					inputSchema: {
+						type: 'object',
+						properties: { query: { type: 'string', description: 'Suchbegriff, z. B. "Skyr natur" oder "Haferflocken"' } },
+						required: ['query'],
+					},
+				},
+				{
+					name: 'log_food',
+					description: 'Yazio: Lebensmittel ins Tagebuch eintragen. Entweder amount (Grundeinheit, meist Gramm/ml) ODER serving + serving_quantity angeben.',
+					inputSchema: {
+						type: 'object',
+						properties: {
+							product_id: { type: 'string', description: 'product_id aus search_food' },
+							daytime: { type: 'string', enum: ['breakfast', 'lunch', 'dinner', 'snack'], description: 'Mahlzeit' },
+							amount: { type: 'number', description: 'Menge in Grundeinheit (g/ml)' },
+							serving: { type: 'string', description: 'Portionsname aus search_food, z. B. "portion", "piece", "glass"' },
+							serving_quantity: { type: 'number', description: 'Anzahl Portionen' },
+							date: { type: 'string', description: 'Datum YYYY-MM-DD (optional, Standard heute)' },
+						},
+						required: ['product_id', 'daytime'],
+					},
+				},
+				{
+					name: 'remove_food',
+					description: 'Yazio: Tagebucheintrag anhand der Eintrags-ID entfernen (ID kommt von log_food).',
+					inputSchema: {
+						type: 'object',
+						properties: { entry_id: { type: 'string', description: 'Eintrags-ID' } },
+						required: ['entry_id'],
+					},
+				},
+				{
+					name: 'get_weight_history',
+					description: 'Yazio: Gewichtsverlauf über die letzten Tage inkl. Veränderung.',
+					inputSchema: {
+						type: 'object',
+						properties: { days: { type: 'number', description: 'Anzahl Tage (Standard 30, max 90)' } },
+						required: [],
+					},
+				},
+				{
+					name: 'get_nutrition_goals',
+					description: 'Yazio: Aktuelle Kalorien-/Makro-/Wasser-/Schritte-Ziele und Profil (Ziel, Diätform, Größe, Aktivitätsgrad).',
+					inputSchema: { type: 'object', properties: {}, required: [] },
+				},
+			] : []),
 		],
 	}));
 
@@ -206,6 +284,14 @@ function createMcpServer(): Server {
 						if (cycle.kilojoule) response += `- **Calories**: ${Math.round(cycle.kilojoule / 4.184)} kcal\n`;
 						if (cycle.avg_hr) response += `- **Avg HR**: ${cycle.avg_hr} bpm\n`;
 						if (cycle.max_hr) response += `- **Max HR**: ${cycle.max_hr} bpm\n`;
+					}
+
+					if (yazio) {
+						try {
+							response += '\n' + (await yazio.getTodayBrief());
+						} catch {
+							// Yazio optional – Whoop-Daten trotzdem liefern
+						}
 					}
 
 					return { content: [{ type: 'text', text: response }] };
@@ -321,6 +407,57 @@ function createMcpServer(): Server {
 					};
 				}
 
+				case 'get_nutrition': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert (YAZIO_USERNAME / YAZIO_PASSWORD fehlen).' }] };
+					return { content: [{ type: 'text', text: await yazio.getDaySummary(typedArgs.date) }] };
+				}
+
+				case 'get_nutrition_trends': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					return { content: [{ type: 'text', text: await yazio.getTrends(validateDays(typedArgs.days)) }] };
+				}
+
+				case 'search_food': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					if (!typedArgs.query) return { content: [{ type: 'text', text: 'query fehlt.' }], isError: true };
+					return { content: [{ type: 'text', text: await yazio.searchFood(typedArgs.query) }] };
+				}
+
+				case 'log_food': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					if (!typedArgs.product_id || !typedArgs.daytime) return { content: [{ type: 'text', text: 'product_id und daytime sind Pflicht.' }], isError: true };
+					return {
+						content: [{
+							type: 'text',
+							text: await yazio.logFood({
+								product_id: typedArgs.product_id,
+								daytime: typedArgs.daytime,
+								amount: typedArgs.amount,
+								serving: typedArgs.serving,
+								serving_quantity: typedArgs.serving_quantity,
+								date: typedArgs.date,
+							}),
+						}],
+					};
+				}
+
+				case 'remove_food': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					if (!typedArgs.entry_id) return { content: [{ type: 'text', text: 'entry_id fehlt.' }], isError: true };
+					return { content: [{ type: 'text', text: await yazio.removeFood(typedArgs.entry_id) }] };
+				}
+
+				case 'get_weight_history': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					const days = typedArgs.days === undefined ? 30 : validateDays(typedArgs.days);
+					return { content: [{ type: 'text', text: await yazio.getWeightHistory(days) }] };
+				}
+
+				case 'get_nutrition_goals': {
+					if (!yazio) return { content: [{ type: 'text', text: 'Yazio ist nicht konfiguriert.' }] };
+					return { content: [{ type: 'text', text: await yazio.getGoals() }] };
+				}
+
 				default:
 					throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
 			}
@@ -343,11 +480,11 @@ async function main(): Promise<void> {
 		const app = express();
 		app.use(express.json());
 		app.use((req: Request, res: Response, next) => {
-	res.on('finish', () => {
-		console.log(`${req.method} ${req.url} → ${res.statusCode} session=${req.headers['mcp-session-id'] ?? '-'} method=${req.body?.method ?? '-'}`);
-	});
-	next();
-});
+			res.on('finish', () => {
+				console.log(`${req.method} ${req.url} → ${res.statusCode} session=${req.headers['mcp-session-id'] ?? '-'} method=${req.body?.method ?? '-'}`);
+			});
+			next();
+		});
 
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
@@ -381,31 +518,31 @@ async function main(): Promise<void> {
 				return;
 			}
 
-					if (req.method === 'POST') {
-			let transport: StreamableHTTPServerTransport;
-			const isInit = req.body?.method === 'initialize';
+			if (req.method === 'POST') {
+				let transport: StreamableHTTPServerTransport;
+				const isInit = req.body?.method === 'initialize';
 
-			if (sessionId && transports.has(sessionId)) {
-				const session = transports.get(sessionId)!;
-				session.lastAccess = Date.now();
-				transport = session.transport;
-			} else if (!sessionId || isInit) {
-				transport = new StreamableHTTPServerTransport({
-					sessionIdGenerator: () => crypto.randomUUID(),
-					onsessioninitialized: newSessionId => {
-						transports.set(newSessionId, { transport, lastAccess: Date.now() });
-					},
-				});
-				const server = createMcpServer();
-				await server.connect(transport);
-			} else {
-				res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+				if (sessionId && transports.has(sessionId)) {
+					const session = transports.get(sessionId)!;
+					session.lastAccess = Date.now();
+					transport = session.transport;
+				} else if (!sessionId || isInit) {
+					transport = new StreamableHTTPServerTransport({
+						sessionIdGenerator: () => crypto.randomUUID(),
+						onsessioninitialized: newSessionId => {
+							transports.set(newSessionId, { transport, lastAccess: Date.now() });
+						},
+					});
+					const server = createMcpServer();
+					await server.connect(transport);
+				} else {
+					res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null });
+					return;
+				}
+
+				await transport.handleRequest(req, res, req.body);
 				return;
 			}
-
-			await transport.handleRequest(req, res, req.body);
-			return;
-		}
 
 			res.status(405).send('Method not allowed');
 		});

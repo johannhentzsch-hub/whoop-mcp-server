@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+RUN npm install
 
 # Copy source files
 COPY tsconfig.json ./
